@@ -1,0 +1,71 @@
+# Auto-deploy to server 16 when the bundle updates.
+# Runs on a self-hosted GitHub Actions runner installed on server 16.
+# The runner only needs docker + docker compose.
+
+name: Deploy to server 16
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker-compose.yml'
+      - '.env.example'
+      - '.github/workflows/deploy-16.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-server-16
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    # Label the runner `hypercube-server-16` when you register it, so an
+    # accidental shared runner on another host doesn't pick this up.
+    # Re-enable this line once the label is applied:
+    #   runs-on: [self-hosted, hypercube-server-16]
+
+    steps:
+      - name: Refresh compose + env template into deploy folder
+        working-directory: /home/agics-ai/docker/hypercube
+        run: |
+          set -euo pipefail
+          curl -fLO https://raw.githubusercontent.com/qkr7287/hypercube-deploy/main/docker-compose.yml
+          # .env is operator-maintained; never overwrite. Pull a copy of the
+          # latest template next to it for reference.
+          curl -fL  https://raw.githubusercontent.com/qkr7287/hypercube-deploy/main/.env.example \
+            -o .env.example.latest
+
+      - name: Pull images
+        working-directory: /home/agics-ai/docker/hypercube
+        run: docker compose pull
+
+      - name: Apply new images (rolling)
+        working-directory: /home/agics-ai/docker/hypercube
+        run: docker compose up -d
+
+      - name: Wait for backend to respond
+        working-directory: /home/agics-ai/docker/hypercube
+        run: |
+          set -e
+          for i in $(seq 1 40); do
+            if docker compose exec -T backend \
+                 python -c "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()" \
+                 >/dev/null 2>&1; then
+              echo "backend healthy"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "backend did not become healthy in time" >&2
+          docker compose logs --tail 80 backend >&2
+          exit 1
+
+      - name: Report state
+        if: always()
+        working-directory: /home/agics-ai/docker/hypercube
+        run: |
+          echo "### Post-deploy state" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker compose ps >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
