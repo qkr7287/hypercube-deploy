@@ -1,0 +1,142 @@
+# HyperCube appliance deploy.
+# Pulls pre-built images from GHCR — no source checkout on the host.
+# Usage:
+#   1. Create `.env` in the same folder (see `.env.example`).
+#   2. `docker compose pull && docker compose up -d`
+#
+# To pin a specific build instead of tracking `latest`, set IMAGE_TAG
+# (for example `sha-abc1234`) in your `.env`.
+
+name: hypercube
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: hc-postgres
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hypercube}
+      POSTGRES_USER: ${DB_USER:-hypercube}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-hypercube}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hc-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: hc-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hc-network
+
+  backend:
+    image: ghcr.io/qkr7287/hypercube-backend:${IMAGE_TAG:-latest}
+    container_name: hc-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-*}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      CORS_ALLOW_ALL_ORIGINS: ${CORS_ALLOW_ALL_ORIGINS:-false}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-}
+      DEBUG: "false"
+      DB_NAME: ${DB_NAME:-hypercube}
+      DB_USER: ${DB_USER:-hypercube}
+      DB_PASSWORD: ${DB_PASSWORD:?}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             uvicorn config.asgi:application --host 0.0.0.0 --port 8000 --workers 4"
+    networks:
+      - hc-network
+
+  celery-worker:
+    image: ghcr.io/qkr7287/hypercube-backend:${IMAGE_TAG:-latest}
+    container_name: hc-celery-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?}
+      DB_NAME: ${DB_NAME:-hypercube}
+      DB_USER: ${DB_USER:-hypercube}
+      DB_PASSWORD: ${DB_PASSWORD:?}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    command: celery -A config worker -l info --concurrency=2
+    networks:
+      - hc-network
+
+  celery-beat:
+    image: ghcr.io/qkr7287/hypercube-backend:${IMAGE_TAG:-latest}
+    container_name: hc-celery-beat
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?}
+      DB_NAME: ${DB_NAME:-hypercube}
+      DB_USER: ${DB_USER:-hypercube}
+      DB_PASSWORD: ${DB_PASSWORD:?}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    command: celery -A config beat -l info
+    networks:
+      - hc-network
+
+  nginx:
+    image: ghcr.io/qkr7287/hypercube-nginx:${IMAGE_TAG:-latest}
+    container_name: hc-nginx
+    restart: unless-stopped
+    ports:
+      - "${HC_PORT:-7003}:7003"
+    depends_on:
+      - backend
+    networks:
+      - hc-network
+
+volumes:
+  postgres_data:
+
+networks:
+  hc-network:
+    driver: bridge
